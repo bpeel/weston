@@ -42,10 +42,9 @@ struct gl_shader {
 	GLuint program;
 	GLuint vertex_shader, fragment_shader;
 	GLint proj_uniform;
-	GLint tex_uniforms[3];
+	GLint tex_uniform;
 	GLint alpha_uniform;
 	GLint color_uniform;
-	const char *vertex_source, *fragment_source;
 };
 
 #define BUFFER_DAMAGE_COUNT 2
@@ -73,6 +72,7 @@ struct gl_output_state {
 	enum gl_border_status border_damage[BUFFER_DAMAGE_COUNT];
 	struct gl_border_image borders[4];
 	enum gl_border_status border_status;
+	int num_views;
 };
 
 enum buffer_type {
@@ -83,14 +83,14 @@ enum buffer_type {
 
 struct gl_surface_state {
 	GLfloat color[4];
-	struct gl_shader *shader;
+	struct gl_shader_set *shader;
 
-	GLuint textures[3];
+	GLuint textures[6];
 	int num_textures;
 	int needs_full_upload;
 	pixman_region32_t texture_damage;
 
-	EGLImageKHR images[3];
+	EGLImageKHR images[6];
 	GLenum target;
 	int num_images;
 
@@ -98,12 +98,26 @@ struct gl_surface_state {
 	enum buffer_type buffer_type;
 	int pitch; /* in pixels */
 	int height; /* in pixels */
+	int num_views;
 	int y_inverted;
 
 	struct weston_surface *surface;
 
 	struct wl_listener surface_destroy_listener;
 	struct wl_listener renderer_destroy_listener;
+};
+
+struct gl_shader_set {
+	const char *declarations;
+	const char *fragment_source;
+	/* Each type of shader needs to have two alternatives, one for
+	 * rendering in stereoscopic and one for rendering in
+	 * monoscopic. If a monoscopic surface is rendered to a
+	 * stereoscopic output then the monoscopic shader will be used
+	 * because that will write to gl_FragColor which ends up in
+	 * both eyes. */
+	struct gl_shader mono;
+	struct gl_shader stereo;
 };
 
 struct gl_renderer {
@@ -123,6 +137,7 @@ struct gl_renderer {
 	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target_texture_2d;
 	PFNEGLCREATEIMAGEKHRPROC create_image;
 	PFNEGLDESTROYIMAGEKHRPROC destroy_image;
+	PFNGLDRAWBUFFERSINDEXEDEXTPROC draw_buffers_indexed;
 
 #ifdef EGL_EXT_swap_buffers_with_damage
 	PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC swap_buffers_with_damage;
@@ -141,13 +156,20 @@ struct gl_renderer {
 
 	int has_configless_context;
 
-	struct gl_shader texture_shader_rgba;
-	struct gl_shader texture_shader_rgbx;
-	struct gl_shader texture_shader_egl_external;
-	struct gl_shader texture_shader_y_uv;
-	struct gl_shader texture_shader_y_u_v;
-	struct gl_shader texture_shader_y_xuxv;
-	struct gl_shader solid_shader;
+	int has_multiview_window;
+	/* This is used as a cache to avoid calling
+	 * glDrawBuffersIndexed unnecessarily when switching outputs.
+	 * It contains the number of views that the last used output
+	 * had */
+	int last_num_views;
+
+	struct gl_shader_set texture_shader_rgba;
+	struct gl_shader_set texture_shader_rgbx;
+	struct gl_shader_set texture_shader_egl_external;
+	struct gl_shader_set texture_shader_y_uv;
+	struct gl_shader_set texture_shader_y_u_v;
+	struct gl_shader_set texture_shader_y_xuxv;
+	struct gl_shader_set solid_shader;
 	struct gl_shader *current_shader;
 
 	struct wl_signal destroy_signal;
@@ -396,8 +418,8 @@ triangle_fan_debug(struct weston_view *view, int first, int count)
 		*index++ = first + i;
 	}
 
-	glUseProgram(gr->solid_shader.program);
-	glUniform4fv(gr->solid_shader.color_uniform, 1,
+	glUseProgram(gr->solid_shader.mono.program);
+	glUniform4fv(gr->solid_shader.mono.color_uniform, 1,
 			color[color_idx++ % ARRAY_LENGTH(color)]);
 	glDrawElements(GL_LINES, nelems, GL_UNSIGNED_SHORT, buffer);
 	glUseProgram(gr->current_shader->program);
@@ -445,6 +467,7 @@ repaint_region(struct weston_view *ev, pixman_region32_t *region,
 	glDisableVertexAttribArray(1);
 	glDisableVertexAttribArray(0);
 
+
 	gr->vertices.size = 0;
 	gr->vtxcnt.size = 0;
 }
@@ -455,10 +478,20 @@ use_output(struct weston_output *output)
 	static int errored;
 	struct gl_output_state *go = get_output_state(output);
 	struct gl_renderer *gr = get_renderer(output->compositor);
+	static const GLenum locations[] =
+		{ GL_MULTIVIEW_EXT, GL_MULTIVIEW_EXT };
+	static const GLint indices[] = { 0, 1 };
 	EGLBoolean ret;
 
 	ret = eglMakeCurrent(gr->egl_display, go->egl_surface,
 			     go->egl_surface, gr->egl_context);
+
+	if (gr->last_num_views != go->num_views) {
+		gr->draw_buffers_indexed(go->num_views,
+					 locations,
+					 indices);
+		gr->last_num_views = go->num_views;
+	}
 
 	if (ret == EGL_FALSE) {
 		if (errored)
@@ -474,17 +507,26 @@ use_output(struct weston_output *output)
 
 static int
 shader_init(struct gl_shader *shader, struct gl_renderer *gr,
-		   const char *vertex_source, const char *fragment_source);
+	    int stereo,
+	    const char *declarations, const char *fragment_source);
 
 static void
-use_shader(struct gl_renderer *gr, struct gl_shader *shader)
+use_shader(struct gl_renderer *gr, struct gl_shader_set *shader_set, int stereo)
 {
+	struct gl_shader *shader;
+
+	if (stereo)
+		shader = &shader_set->stereo;
+	else
+		shader = &shader_set->mono;
+
 	if (!shader->program) {
 		int ret;
 
-		ret =  shader_init(shader, gr,
-				   shader->vertex_source,
-				   shader->fragment_source);
+		ret = shader_init(shader, gr,
+				  stereo,
+				  shader_set->declarations,
+				  shader_set->fragment_source);
 
 		if (ret < 0)
 			weston_log("warning: failed to compile shader\n");
@@ -496,21 +538,38 @@ use_shader(struct gl_renderer *gr, struct gl_shader *shader)
 	gr->current_shader = shader;
 }
 
+static int
+using_stereo(struct gl_surface_state *gs, struct weston_output *output)
+{
+	struct gl_output_state *go = get_output_state(output);
+
+	return gs->num_views == 2 && go->num_views == 2;
+}
+
 static void
 shader_uniforms(struct gl_shader *shader,
 		struct weston_view *view,
 		struct weston_output *output)
 {
-	int i;
 	struct gl_surface_state *gs = get_surface_state(view->surface);
+	static const GLint texture_units[] = { 0, 1, 2, 3, 4, 5 };
 
 	glUniformMatrix4fv(shader->proj_uniform,
 			   1, GL_FALSE, output->matrix.d);
 	glUniform4fv(shader->color_uniform, 1, gs->color);
 	glUniform1f(shader->alpha_uniform, view->alpha);
 
-	for (i = 0; i < gs->num_textures; i++)
-		glUniform1i(shader->tex_uniforms[i], i);
+	/* If the surface has textures for multiple views but we're
+	 * not using them then we'll only want to upload half of the
+	 * texture uniforms */
+	if (gs->num_views == 2 && !using_stereo(gs, output))
+		glUniform1iv(shader->tex_uniform,
+			     gs->num_textures / 2,
+			     (GLint *) texture_units);
+	else
+		glUniform1iv(shader->tex_uniform,
+			     gs->num_textures,
+			     (GLint *) texture_units);
 }
 
 static void
@@ -544,12 +603,12 @@ draw_view(struct weston_view *ev, struct weston_output *output,
 	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
 	if (gr->fan_debug) {
-		use_shader(gr, &gr->solid_shader);
-		shader_uniforms(&gr->solid_shader, ev, output);
+		use_shader(gr, &gr->solid_shader, 0);
+		shader_uniforms(gr->current_shader, ev, output);
 	}
 
-	use_shader(gr, gs->shader);
-	shader_uniforms(gs->shader, ev, output);
+	use_shader(gr, gs->shader, using_stereo(gs, output));
+	shader_uniforms(gr->current_shader, ev, output);
 
 	if (ev->transform.enabled || output->zoom.active ||
 	    output->current_scale != ev->surface->buffer_viewport.scale)
@@ -577,8 +636,10 @@ draw_view(struct weston_view *ev, struct weston_output *output,
 			 * that forces texture alpha = 1.0.
 			 * Xwayland surfaces need this.
 			 */
-			use_shader(gr, &gr->texture_shader_rgbx);
-			shader_uniforms(&gr->texture_shader_rgbx, ev, output);
+			use_shader(gr,
+				   &gr->texture_shader_rgbx,
+				   using_stereo(gs, output));
+			shader_uniforms(gr->current_shader, ev, output);
 		}
 
 		if (ev->alpha < 1.0)
@@ -590,7 +651,7 @@ draw_view(struct weston_view *ev, struct weston_output *output,
 	}
 
 	if (pixman_region32_not_empty(&surface_blend)) {
-		use_shader(gr, gs->shader);
+		use_shader(gr, gs->shader, using_stereo(gs, output));
 		glEnable(GL_BLEND);
 		repaint_region(ev, &repaint, &surface_blend);
 	}
@@ -699,7 +760,7 @@ draw_output_borders(struct weston_output *output,
 {
 	struct gl_output_state *go = get_output_state(output);
 	struct gl_renderer *gr = get_renderer(output->compositor);
-	struct gl_shader *shader = &gr->texture_shader_rgba;
+	struct gl_shader_set *shader = &gr->texture_shader_rgba;
 	struct gl_border_image *top, *bottom, *left, *right;
 	struct weston_matrix matrix;
 	int full_width, full_height;
@@ -716,17 +777,18 @@ draw_output_borders(struct weston_output *output,
 	full_height = output->current_mode->height + top->height + bottom->height;
 
 	glDisable(GL_BLEND);
-	use_shader(gr, shader);
+	use_shader(gr, shader, 0);
 
 	glViewport(0, 0, full_width, full_height);
 
 	weston_matrix_init(&matrix);
 	weston_matrix_translate(&matrix, -full_width/2.0, -full_height/2.0, 0);
 	weston_matrix_scale(&matrix, 2.0/full_width, -2.0/full_height, 1);
-	glUniformMatrix4fv(shader->proj_uniform, 1, GL_FALSE, matrix.d);
+	glUniformMatrix4fv(gr->current_shader->proj_uniform, 1,
+			   GL_FALSE, matrix.d);
 
-	glUniform1i(shader->tex_uniforms[0], 0);
-	glUniform1f(shader->alpha_uniform, 1);
+	glUniform1i(gr->current_shader->tex_uniform, 0);
+	glUniform1f(gr->current_shader->alpha_uniform, 1);
 	glActiveTexture(GL_TEXTURE0);
 
 	if (border_status & BORDER_TOP_DIRTY)
@@ -1171,13 +1233,58 @@ gl_renderer_attach_shm(struct weston_surface *es, struct weston_buffer *buffer,
 }
 
 static void
+create_images(struct gl_renderer *gr,
+	      struct gl_surface_state *gs,
+	      int num_planes,
+	      struct weston_buffer *buffer)
+{
+	int num_views = MIN(gs->num_views, 2);
+	EGLint attribs[5];
+	int plane, view, tex_num = 0;
+
+	attribs[2] = EGL_NONE;
+
+	ensure_textures(gs, num_planes * gs->num_views);
+	for (view = 0; view < num_views; view++) {
+		for (plane = 0; plane < num_planes; plane++) {
+			attribs[0] = EGL_WAYLAND_PLANE_WL;
+			attribs[1] = plane;
+
+			gs->images[tex_num] =
+				gr->create_image(gr->egl_display,
+						 NULL,
+						 EGL_WAYLAND_BUFFER_WL,
+						 buffer->legacy_buffer,
+						 attribs);
+
+			if (!gs->images[tex_num]) {
+				weston_log("failed to create img for "
+					   "plane %d view %d\n",
+					   plane, view);
+				continue;
+			}
+
+			tex_num++;
+		}
+
+		/* This is only set on subsequent iterations so that
+		 * we'll leave it completely unspecified when the GL
+		 * driver doesn't support the multiview extension */
+		attribs[2] = EGL_MULTIVIEW_VIEW_WL;
+		attribs[3] = view + 1;
+		attribs[4] = EGL_NONE;
+	}
+
+	gs->num_images = tex_num;
+}
+
+static void
 gl_renderer_attach_egl(struct weston_surface *es, struct weston_buffer *buffer,
 		       uint32_t format)
 {
 	struct weston_compositor *ec = es->compositor;
 	struct gl_renderer *gr = get_renderer(ec);
 	struct gl_surface_state *gs = get_surface_state(es);
-	EGLint attribs[3];
 	int i, num_planes;
 
 	buffer->legacy_buffer = (struct wl_buffer *)buffer->resource;
@@ -1192,10 +1299,17 @@ gl_renderer_attach_egl(struct weston_surface *es, struct weston_buffer *buffer,
 		gr->destroy_image(gr->egl_display, gs->images[i]);
 	gs->num_images = 0;
 	gs->target = GL_TEXTURE_2D;
+	gs->num_views = 1;
 	switch (format) {
 	case EGL_TEXTURE_RGB:
 	case EGL_TEXTURE_RGBA:
 	default:
+		if (gr->has_multiview_window)
+			gr->query_buffer(gr->egl_display,
+					 buffer->legacy_buffer,
+					 EGL_MULTIVIEW_VIEW_COUNT_EXT,
+					 &gs->num_views);
+
 		num_planes = 1;
 		gs->shader = &gr->texture_shader_rgba;
 		break;
@@ -1218,22 +1332,9 @@ gl_renderer_attach_egl(struct weston_surface *es, struct weston_buffer *buffer,
 		break;
 	}
 
-	ensure_textures(gs, num_planes);
-	for (i = 0; i < num_planes; i++) {
-		attribs[0] = EGL_WAYLAND_PLANE_WL;
-		attribs[1] = i;
-		attribs[2] = EGL_NONE;
-		gs->images[i] = gr->create_image(gr->egl_display,
-						 NULL,
-						 EGL_WAYLAND_BUFFER_WL,
-						 buffer->legacy_buffer,
-						 attribs);
-		if (!gs->images[i]) {
-			weston_log("failed to create img for plane %d\n", i);
-			continue;
-		}
-		gs->num_images++;
+	create_images(gr, gs, num_planes, buffer);
 
+	for (i = 0; i < gs->num_images; i++) {
 		glActiveTexture(GL_TEXTURE0 + i);
 		glBindTexture(gs->target, gs->textures[i]);
 		gr->image_target_texture_2d(gs->target,
@@ -1402,100 +1503,16 @@ static const char vertex_shader[] =
 
 /* Declare common fragment shader uniforms */
 #define FRAGMENT_CONVERT_YUV						\
-	"  y *= alpha;\n"						\
-	"  u *= alpha;\n"						\
-	"  v *= alpha;\n"						\
-	"  gl_FragColor.r = y + 1.59602678 * v;\n"			\
-	"  gl_FragColor.g = y - 0.39176229 * u - 0.81296764 * v;\n"	\
-	"  gl_FragColor.b = y + 2.01723214 * u;\n"			\
-	"  gl_FragColor.a = alpha;\n"
+	"  y = (y - 0.0625) * 1.6438356 * alpha;\n"			\
+	"  u = (u - 0.5) * alpha;\n"					\
+	"  v = (v - 0.5) * alpha;\n"					\
+	"  OUT.r = y + 1.59602678 * v;\n"				\
+	"  OUT.g = y - 0.39176229 * u - 0.81296764 * v;\n"		\
+	"  OUT.b = y + 2.01723214 * u;\n"				\
+	"  OUT.a = alpha;\n"
 
 static const char fragment_debug[] =
-	"  gl_FragColor = vec4(0.0, 0.3, 0.0, 0.2) + gl_FragColor * 0.8;\n";
-
-static const char fragment_brace[] =
-	"}\n";
-
-static const char texture_fragment_shader_rgba[] =
-	"precision mediump float;\n"
-	"varying vec2 v_texcoord;\n"
-	"uniform sampler2D tex;\n"
-	"uniform float alpha;\n"
-	"void main()\n"
-	"{\n"
-	"   gl_FragColor = alpha * texture2D(tex, v_texcoord)\n;"
-	;
-
-static const char texture_fragment_shader_rgbx[] =
-	"precision mediump float;\n"
-	"varying vec2 v_texcoord;\n"
-	"uniform sampler2D tex;\n"
-	"uniform float alpha;\n"
-	"void main()\n"
-	"{\n"
-	"   gl_FragColor.rgb = alpha * texture2D(tex, v_texcoord).rgb\n;"
-	"   gl_FragColor.a = alpha;\n"
-	;
-
-static const char texture_fragment_shader_egl_external[] =
-	"#extension GL_OES_EGL_image_external : require\n"
-	"precision mediump float;\n"
-	"varying vec2 v_texcoord;\n"
-	"uniform samplerExternalOES tex;\n"
-	"uniform float alpha;\n"
-	"void main()\n"
-	"{\n"
-	"   gl_FragColor = alpha * texture2D(tex, v_texcoord)\n;"
-	;
-
-static const char texture_fragment_shader_y_uv[] =
-	"precision mediump float;\n"
-	"uniform sampler2D tex;\n"
-	"uniform sampler2D tex1;\n"
-	"varying vec2 v_texcoord;\n"
-	"uniform float alpha;\n"
-	"void main() {\n"
-	"  float y = 1.16438356 * (texture2D(tex, v_texcoord).x - 0.0625);\n"
-	"  float u = texture2D(tex1, v_texcoord).r - 0.5;\n"
-	"  float v = texture2D(tex1, v_texcoord).g - 0.5;\n"
-	FRAGMENT_CONVERT_YUV
-	;
-
-static const char texture_fragment_shader_y_u_v[] =
-	"precision mediump float;\n"
-	"uniform sampler2D tex;\n"
-	"uniform sampler2D tex1;\n"
-	"uniform sampler2D tex2;\n"
-	"varying vec2 v_texcoord;\n"
-	"uniform float alpha;\n"
-	"void main() {\n"
-	"  float y = 1.16438356 * (texture2D(tex, v_texcoord).x - 0.0625);\n"
-	"  float u = texture2D(tex1, v_texcoord).x - 0.5;\n"
-	"  float v = texture2D(tex2, v_texcoord).x - 0.5;\n"
-	FRAGMENT_CONVERT_YUV
-	;
-
-static const char texture_fragment_shader_y_xuxv[] =
-	"precision mediump float;\n"
-	"uniform sampler2D tex;\n"
-	"uniform sampler2D tex1;\n"
-	"varying vec2 v_texcoord;\n"
-	"uniform float alpha;\n"
-	"void main() {\n"
-	"  float y = 1.16438356 * (texture2D(tex, v_texcoord).x - 0.0625);\n"
-	"  float u = texture2D(tex1, v_texcoord).g - 0.5;\n"
-	"  float v = texture2D(tex1, v_texcoord).a - 0.5;\n"
-	FRAGMENT_CONVERT_YUV
-	;
-
-static const char solid_fragment_shader[] =
-	"precision mediump float;\n"
-	"uniform vec4 color;\n"
-	"uniform float alpha;\n"
-	"void main()\n"
-	"{\n"
-	"   gl_FragColor = alpha * color\n;"
-	;
+	"  OUT = vec4(0.0, 0.3, 0.0, 0.2) + OUT * 0.8;\n";
 
 static int
 compile_shader(GLenum type, int count, const char **sources)
@@ -1519,29 +1536,54 @@ compile_shader(GLenum type, int count, const char **sources)
 
 static int
 shader_init(struct gl_shader *shader, struct gl_renderer *renderer,
-		   const char *vertex_source, const char *fragment_source)
+	    int stereo,
+	    const char *declarations,
+	    const char *fragment_source)
 {
 	char msg[512];
 	GLint status;
-	int count;
-	const char *sources[3];
+	const char *sources[9];
+	int n_sources = 0;
 
+	sources[0] = vertex_shader;
 	shader->vertex_shader =
-		compile_shader(GL_VERTEX_SHADER, 1, &vertex_source);
+		compile_shader(GL_VERTEX_SHADER, 1, sources);
 
-	if (renderer->fragment_shader_debug) {
-		sources[0] = fragment_source;
-		sources[1] = fragment_debug;
-		sources[2] = fragment_brace;
-		count = 3;
+	if (stereo)
+		sources[n_sources++] = "#define N_VIEWS 2\n";
+	else
+		sources[n_sources++] = "#define N_VIEWS 1\n";
+
+	sources[n_sources++] = declarations;
+
+	if (stereo) {
+		sources[n_sources++] =
+			"#define OUT gl_FragData[VIEW]\n"
+			"void main() {\n"
+			"#define VIEW 0\n";
+		sources[n_sources++] = fragment_source;
+		if (renderer->fragment_shader_debug)
+			sources[n_sources++] = fragment_debug;
+		sources[n_sources++] =
+			"#undef VIEW\n"
+			"#define VIEW 1\n";
+		sources[n_sources++] = fragment_source;
+		if (renderer->fragment_shader_debug)
+			sources[n_sources++] = fragment_debug;
+		sources[n_sources++] = "}\n";
 	} else {
-		sources[0] = fragment_source;
-		sources[1] = fragment_brace;
-		count = 2;
+		sources[n_sources++] =
+			"#define VIEW 0\n"
+			"#define OUT gl_FragColor\n"
+			"void main() {\n";
+		sources[n_sources++] = fragment_source;
+		if (renderer->fragment_shader_debug)
+			sources[n_sources++] = fragment_debug;
+		sources[n_sources++] = "}\n";
 	}
 
 	shader->fragment_shader =
-		compile_shader(GL_FRAGMENT_SHADER, count, sources);
+		compile_shader(GL_FRAGMENT_SHADER, n_sources, sources);
 
 	shader->program = glCreateProgram();
 	glAttachShader(shader->program, shader->vertex_shader);
@@ -1558,9 +1600,7 @@ shader_init(struct gl_shader *shader, struct gl_renderer *renderer,
 	}
 
 	shader->proj_uniform = glGetUniformLocation(shader->program, "proj");
-	shader->tex_uniforms[0] = glGetUniformLocation(shader->program, "tex");
-	shader->tex_uniforms[1] = glGetUniformLocation(shader->program, "tex1");
-	shader->tex_uniforms[2] = glGetUniformLocation(shader->program, "tex2");
+	shader->tex_uniform = glGetUniformLocation(shader->program, "tex");
 	shader->alpha_uniform = glGetUniformLocation(shader->program, "alpha");
 	shader->color_uniform = glGetUniformLocation(shader->program, "color");
 
@@ -1577,6 +1617,13 @@ shader_release(struct gl_shader *shader)
 	shader->vertex_shader = 0;
 	shader->fragment_shader = 0;
 	shader->program = 0;
+}
+
+static void
+shader_set_release(struct gl_shader_set *shader_set)
+{
+	shader_release(&shader_set->mono);
+	shader_release(&shader_set->stereo);
 }
 
 static void
@@ -1743,6 +1790,10 @@ gl_renderer_output_create(struct weston_output *output,
 	struct gl_renderer *gr = get_renderer(ec);
 	struct gl_output_state *go;
 	EGLConfig egl_config;
+	static const EGLint stereo_attrs[] = {
+		EGL_MULTIVIEW_VIEW_COUNT_EXT, 2,
+		EGL_NONE
+	};
 	int i;
 
 	if (egl_choose_config(gr, attribs, visual_id, &egl_config) == -1) {
@@ -1766,7 +1817,9 @@ gl_renderer_output_create(struct weston_output *output,
 	go->egl_surface =
 		eglCreateWindowSurface(gr->egl_display,
 				       egl_config,
-				       window, NULL);
+				       window,
+				       gr->has_multiview_window ?
+				       stereo_attrs : NULL);
 
 	if (go->egl_surface == EGL_NO_SURFACE) {
 		weston_log("failed to create egl surface\n");
@@ -1786,6 +1839,19 @@ gl_renderer_output_create(struct weston_output *output,
 	output->renderer_state = go;
 
 	log_egl_config_info(gr->egl_display, egl_config);
+
+	go->num_views = 1;
+	if (gr->has_multiview_window) {
+		/* Querying the actual view count for a surface can
+		 * only be done by first binding the context and
+		 * querying through that. */
+		if (use_output(output) >= 0)
+			eglQueryContext(gr->egl_display,
+					gr->egl_context,
+					EGL_MULTIVIEW_VIEW_COUNT_EXT,
+					&go->num_views);
+	}
+	weston_log("View count for output is %i\n", go->num_views);
 
 	return 0;
 }
@@ -1891,6 +1957,9 @@ gl_renderer_setup_egl_extensions(struct weston_compositor *ec)
 		gr->has_configless_context = 1;
 #endif
 
+	gr->has_multiview_window =
+		!!strstr(extensions, "EGL_EXT_multiview_window");
+
 	return 0;
 }
 
@@ -1933,6 +2002,8 @@ gl_renderer_create(struct weston_compositor *ec, EGLNativeDisplayType display,
 	gr->base.surface_set_color = gl_renderer_surface_set_color;
 	gr->base.destroy = gl_renderer_destroy;
 
+	gr->last_num_views = 1;
+
 	gr->egl_display = eglGetDisplay(display);
 	if (gr->egl_display == EGL_NO_DISPLAY) {
 		weston_log("failed to create display\n");
@@ -1974,36 +2045,76 @@ gl_renderer_display(struct weston_compositor *ec)
 	return get_renderer(ec)->egl_display;
 }
 
-static int
-compile_shaders(struct weston_compositor *ec)
+static void
+setup_shaders(struct weston_compositor *ec)
 {
 	struct gl_renderer *gr = get_renderer(ec);
 
-	gr->texture_shader_rgba.vertex_source = vertex_shader;
-	gr->texture_shader_rgba.fragment_source = texture_fragment_shader_rgba;
+	gr->texture_shader_rgba.declarations =
+		"precision mediump float;\n"
+		"varying vec2 v_texcoord;\n"
+		"uniform sampler2D tex[N_VIEWS];\n"
+		"uniform float alpha;\n";
+	gr->texture_shader_rgba.fragment_source =
+		"  OUT = alpha * texture2D(tex[VIEW], v_texcoord);\n";
 
-	gr->texture_shader_rgbx.vertex_source = vertex_shader;
-	gr->texture_shader_rgbx.fragment_source = texture_fragment_shader_rgbx;
+	gr->texture_shader_rgbx.declarations =
+		gr->texture_shader_rgba.declarations;
+	gr->texture_shader_rgbx.fragment_source =
+		"  OUT = vec4(alpha * texture2D(tex[VIEW], v_texcoord).rgb,\n"
+		"             1);\n";
 
-	gr->texture_shader_egl_external.vertex_source = vertex_shader;
+	gr->texture_shader_egl_external.declarations =
+		"#extension GL_OES_EGL_image_external : require\n"
+		"precision mediump float;\n"
+		"varying vec2 v_texcoord;\n"
+		"uniform samplerExternalOES tex[N_VIEWS];\n"
+		"uniform float alpha;\n";
 	gr->texture_shader_egl_external.fragment_source =
-		texture_fragment_shader_egl_external;
+		gr->texture_shader_rgba.fragment_source;
 
-	gr->texture_shader_y_uv.vertex_source = vertex_shader;
-	gr->texture_shader_y_uv.fragment_source = texture_fragment_shader_y_uv;
+	gr->texture_shader_y_uv.declarations =
+		"precision mediump float;\n"
+		"uniform sampler2D tex[N_VIEWS * 2];\n"
+		"varying vec2 v_texcoord;\n"
+		"uniform float alpha;\n";
+	gr->texture_shader_y_uv.fragment_source =
+		"  {\n"
+		"    float y = texture2D(tex[VIEW * 2], v_texcoord).x;\n"
+		"    float u = texture2D(tex[VIEW * 2 + 1], v_texcoord).r;\n"
+		"    float v = texture2D(tex[VIEW * 2 + 1], v_texcoord).g;\n"
+		FRAGMENT_CONVERT_YUV
+		"  }\n";
 
-	gr->texture_shader_y_u_v.vertex_source = vertex_shader;
+	gr->texture_shader_y_u_v.declarations =
+		"precision mediump float;\n"
+		"uniform sampler2D tex[N_VIEWS * 3];\n"
+		"varying vec2 v_texcoord;\n"
+		"uniform float alpha;\n";
 	gr->texture_shader_y_u_v.fragment_source =
-		texture_fragment_shader_y_u_v;
+		"  {\n"
+		"    float y = texture2D(tex[VIEW * 3], v_texcoord).x;\n"
+		"    float u = texture2D(tex[VIEW * 3 + 1], v_texcoord).x;\n"
+		"    float v = texture2D(tex[VIEW * 3 + 2], v_texcoord).x;\n"
+		FRAGMENT_CONVERT_YUV
+		"  }\n";
 
-	gr->texture_shader_y_xuxv.vertex_source = vertex_shader;
+	gr->texture_shader_y_xuxv.declarations =
+		gr->texture_shader_y_uv.declarations;
 	gr->texture_shader_y_xuxv.fragment_source =
-		texture_fragment_shader_y_xuxv;
+		"  {\n"
+		"    float y = texture2D(tex[VIEW * 2], v_texcoord).x;\n"
+		"    float u = texture2D(tex[VIEW * 2 + 1], v_texcoord).g;\n"
+		"    float v = texture2D(tex[VIEW * 2 + 1], v_texcoord).a;\n"
+		FRAGMENT_CONVERT_YUV
+		"  }\n";
 
-	gr->solid_shader.vertex_source = vertex_shader;
-	gr->solid_shader.fragment_source = solid_fragment_shader;
-
-	return 0;
+	gr->solid_shader.declarations =
+		"precision mediump float;\n"
+		"uniform vec4 color;\n"
+		"uniform float alpha;\n";
+	gr->solid_shader.fragment_source =
+		"OUT = alpha * color;\n";
 }
 
 static void
@@ -2016,13 +2127,13 @@ fragment_debug_binding(struct weston_seat *seat, uint32_t time, uint32_t key,
 
 	gr->fragment_shader_debug ^= 1;
 
-	shader_release(&gr->texture_shader_rgba);
-	shader_release(&gr->texture_shader_rgbx);
-	shader_release(&gr->texture_shader_egl_external);
-	shader_release(&gr->texture_shader_y_uv);
-	shader_release(&gr->texture_shader_y_u_v);
-	shader_release(&gr->texture_shader_y_xuxv);
-	shader_release(&gr->solid_shader);
+	shader_set_release(&gr->texture_shader_rgba);
+	shader_set_release(&gr->texture_shader_rgbx);
+	shader_set_release(&gr->texture_shader_egl_external);
+	shader_set_release(&gr->texture_shader_y_uv);
+	shader_set_release(&gr->texture_shader_y_u_v);
+	shader_set_release(&gr->texture_shader_y_xuxv);
+	shader_set_release(&gr->solid_shader);
 
 	/* Force use_shader() to call glUseProgram(), since we need to use
 	 * the recompiled version of the shader. */
@@ -2114,10 +2225,19 @@ gl_renderer_setup(struct weston_compositor *ec, EGLSurface egl_surface)
 	if (strstr(extensions, "GL_OES_EGL_image_external"))
 		gr->has_egl_image_external = 1;
 
+	if (gr->has_multiview_window) {
+		if (!strstr(extensions, "GL_EXT_multiview_draw_buffers")) {
+			weston_log("EGL_EXT_multiview_window is advertised "
+				   "without GL_EXT_multiview_draw_buffers\n");
+			return -1;
+		}
+		gr->draw_buffers_indexed =
+			(void *) eglGetProcAddress("glDrawBuffersIndexedEXT");
+	}
+
 	glActiveTexture(GL_TEXTURE0);
 
-	if (compile_shaders(ec))
-		return -1;
+	setup_shaders(ec);
 
 	gr->fragment_binding =
 		weston_compositor_add_debug_binding(ec, KEY_S,

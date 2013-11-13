@@ -207,6 +207,21 @@ static struct gl_renderer_interface *gl_renderer;
 
 static const char default_seat[] = "seat0";
 
+static const struct {
+	const char *name;
+	int flags;
+} stereo_layouts[] = {
+	{ "none", DRM_MODE_FLAG_3D_NONE },
+	{ "fp", DRM_MODE_FLAG_3D_FRAME_PACKING },
+	{ "fa", DRM_MODE_FLAG_3D_FIELD_ALTERNATIVE },
+	{ "la", DRM_MODE_FLAG_3D_LINE_ALTERNATIVE },
+	{ "sbsf", DRM_MODE_FLAG_3D_SIDE_BY_SIDE_FULL },
+	{ "ld", DRM_MODE_FLAG_3D_L_DEPTH },
+	{ "ldggd", DRM_MODE_FLAG_3D_L_DEPTH_GFX_GFX_DEPTH },
+	{ "tb", DRM_MODE_FLAG_3D_TOP_AND_BOTTOM },
+	{ "sbsh", DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF }
+};
+
 static void
 drm_output_set_cursor(struct drm_output *output);
 
@@ -417,6 +432,44 @@ drm_output_release_fb(struct drm_output *output, struct drm_fb *fb)
 	}
 }
 
+static int
+bo_valid_for_stereo_mode(const drmModeModeInfo *info,
+			 struct gbm_bo *bo)
+{
+	uint32_t vactive_space;
+
+	switch (info->flags & DRM_MODE_FLAG_3D_MASK) {
+	case DRM_MODE_FLAG_3D_NONE:
+		return 1;
+
+	case DRM_MODE_FLAG_3D_FRAME_PACKING:
+		vactive_space = info->vtotal - info->vdisplay;
+		return (gbm_bo_get_eye_width(bo) == info->hdisplay &&
+			gbm_bo_get_eye_height(bo) == info->vdisplay &&
+			gbm_bo_get_right_eye_y(bo) ==
+			vactive_space + info->vdisplay &&
+			gbm_bo_get_right_eye_x(bo) == 0);
+
+	case DRM_MODE_FLAG_3D_SIDE_BY_SIDE_FULL:
+		return (gbm_bo_get_eye_width(bo) == info->hdisplay &&
+			gbm_bo_get_eye_height(bo) == info->vdisplay &&
+			gbm_bo_get_right_eye_x(bo) == info->hdisplay &&
+			gbm_bo_get_right_eye_y(bo) == 0);
+
+	case DRM_MODE_FLAG_3D_LINE_ALTERNATIVE:
+		return (gbm_bo_get_eye_width(bo) == info->hdisplay &&
+			gbm_bo_get_eye_height(bo) == info->vdisplay &&
+			gbm_bo_get_right_eye_x(bo) == 0 &&
+			gbm_bo_get_right_eye_y(bo) == 1 &&
+			gbm_bo_get_eye_stride(bo) ==
+			gbm_bo_get_stride(bo) * 2);
+		return 1;
+
+	default:
+		return 0;
+	}
+}
+
 static uint32_t
 drm_output_check_scanout_format(struct drm_output *output,
 				struct weston_surface *es, struct gbm_bo *bo)
@@ -455,6 +508,7 @@ drm_output_prepare_scanout_view(struct weston_output *_output,
 	struct drm_compositor *c =
 		(struct drm_compositor *) output->base.compositor;
 	struct weston_buffer *buffer = ev->surface->buffer_ref.buffer;
+	struct drm_mode *mode;
 	struct gbm_bo *bo;
 	uint32_t format;
 
@@ -467,12 +521,19 @@ drm_output_prepare_scanout_view(struct weston_output *_output,
 	    ev->transform.enabled)
 		return NULL;
 
+	mode = (struct drm_mode *) output->base.current_mode;
+
 	bo = gbm_bo_import(c->gbm, GBM_BO_IMPORT_WL_BUFFER,
 			   buffer->resource, GBM_BO_USE_SCANOUT);
 
 	/* Unable to use the buffer for scanout */
 	if (!bo)
 		return NULL;
+
+	if (!bo_valid_for_stereo_mode(&mode->mode_info, bo)) {
+		gbm_bo_destroy(bo);
+		return NULL;
+	}
 
 	format = drm_output_check_scanout_format(output, ev->surface, bo);
 	if (format == 0) {
@@ -1291,6 +1352,8 @@ init_drm(struct drm_compositor *ec, struct udev_device *device)
 	else
 		ec->clock = CLOCK_REALTIME;
 
+	drmSetClientCap(fd, DRM_CLIENT_CAP_STEREO_3D, 1);
+
 	return 0;
 }
 
@@ -1809,7 +1872,32 @@ find_and_parse_output_edid(struct drm_compositor *ec,
 	drmModeFreePropertyBlob(edid_blob);
 }
 
+static int
+parse_mode(const char *s, int *width, int *height, unsigned int *stereo_layout)
+{
+	char *layout_str;
+	size_t i;
 
+	if (sscanf(s, "%dx%d", width, height) != 2)
+		return 0;
+
+	layout_str = strchr(s, ',');
+	if (layout_str == NULL)
+		return 1;
+
+	layout_str++;
+
+	for (i = 0;
+	     i < sizeof(stereo_layouts) / sizeof(stereo_layouts[0]);
+	     i++) {
+		if (!strcmp(layout_str, stereo_layouts[i].name)) {
+			*stereo_layout = stereo_layouts[i].flags;
+			return 1;
+		}
+	}
+
+	return 0;
+}
 
 static int
 parse_modeline(const char *s, drmModeModeInfo *mode)
@@ -1928,6 +2016,54 @@ get_gbm_format_from_section(struct weston_config_section *section,
 }
 
 static int
+can_use_stereo_layout(const drmModeModeInfo *info)
+{
+	switch (info->flags & DRM_MODE_FLAG_3D_MASK) {
+	case DRM_MODE_FLAG_3D_NONE:
+		return 1;
+
+	case DRM_MODE_FLAG_3D_FRAME_PACKING:
+	case DRM_MODE_FLAG_3D_SIDE_BY_SIDE_FULL:
+	case DRM_MODE_FLAG_3D_LINE_ALTERNATIVE:
+		return 1;
+
+	case DRM_MODE_FLAG_3D_TOP_AND_BOTTOM:
+	case DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF:
+		/* We probably could handle these but there are some
+		 * complications because they effectively have
+		 * non-square pixels */
+		return 0;
+
+	case DRM_MODE_FLAG_3D_FIELD_ALTERNATIVE:
+		/* Mesa can't render to this mode */
+		return 0;
+
+	case DRM_MODE_FLAG_3D_L_DEPTH:
+	case DRM_MODE_FLAG_3D_L_DEPTH_GFX_GFX_DEPTH:
+		/* These layouts have a separate area describing the
+		 * depth information */
+		return 0;
+	}
+
+	return 0;
+}
+
+static const char *
+get_stereo_layout_name(int stereo_layout)
+{
+	size_t i;
+
+	for (i = 0;
+	     i < sizeof(stereo_layouts) / sizeof(stereo_layouts[0]);
+	     i++) {
+		if (stereo_layout == stereo_layouts[i].flags)
+			return stereo_layouts[i].name;
+	}
+
+	return NULL;
+}
+
+static int
 create_output_for_connector(struct drm_compositor *ec,
 			    drmModeRes *resources,
 			    drmModeConnector *connector,
@@ -1941,6 +2077,8 @@ create_output_for_connector(struct drm_compositor *ec,
 	drmModeModeInfo crtc_mode, modeline;
 	drmModeCrtc *crtc;
 	int i, width, height, scale;
+	unsigned int stereo_layout;
+	const char *stereo_layout_name;
 	char name[32], *s;
 	const char *type_name;
 	enum output_config config;
@@ -1978,7 +2116,7 @@ create_output_for_connector(struct drm_compositor *ec,
 		config = OUTPUT_CONFIG_PREFERRED;
 	else if (strcmp(s, "current") == 0)
 		config = OUTPUT_CONFIG_CURRENT;
-	else if (sscanf(s, "%dx%d", &width, &height) == 2)
+	else if (parse_mode(s, &width, &height, &stereo_layout))
 		config = OUTPUT_CONFIG_MODE;
 	else if (parse_modeline(s, &modeline) == 0)
 		config = OUTPUT_CONFIG_MODELINE;
@@ -2027,6 +2165,9 @@ create_output_for_connector(struct drm_compositor *ec,
 	}
 
 	for (i = 0; i < connector->count_modes; i++) {
+		if (!can_use_stereo_layout(&connector->modes[i]))
+			continue;
+
 		drm_mode = drm_output_add_mode(output, &connector->modes[i]);
 		if (!drm_mode)
 			goto err_free;
@@ -2047,7 +2188,9 @@ create_output_for_connector(struct drm_compositor *ec,
 	wl_list_for_each_reverse(drm_mode, &output->base.mode_list, base.link) {
 		if (config == OUTPUT_CONFIG_MODE &&
 		    width == drm_mode->base.width &&
-		    height == drm_mode->base.height)
+		    height == drm_mode->base.height &&
+		    stereo_layout == (drm_mode->mode_info.flags &
+				      DRM_MODE_FLAG_3D_MASK))
 			configured = drm_mode;
 		if (!memcmp(&crtc_mode, &drm_mode->mode_info, sizeof crtc_mode))
 			current = drm_mode;
@@ -2139,8 +2282,13 @@ create_output_for_connector(struct drm_compositor *ec,
 
 	weston_log("Output %s, (connector %d, crtc %d)\n",
 		   output->base.name, output->connector_id, output->crtc_id);
-	wl_list_for_each(m, &output->base.mode_list, link)
-		weston_log_continue(STAMP_SPACE "mode %dx%d@%.1f%s%s%s\n",
+	wl_list_for_each(drm_mode, &output->base.mode_list, base.link) {
+		stereo_layout =
+			drm_mode->mode_info.flags & DRM_MODE_FLAG_3D_MASK;
+		stereo_layout_name =
+			get_stereo_layout_name(stereo_layout);
+		m = &drm_mode->base;
+		weston_log_continue(STAMP_SPACE "mode %dx%d@%.1f%s%s%s",
 				    m->width, m->height, m->refresh / 1000.0,
 				    m->flags & WL_OUTPUT_MODE_PREFERRED ?
 				    ", preferred" : "",
@@ -2148,6 +2296,11 @@ create_output_for_connector(struct drm_compositor *ec,
 				    ", current" : "",
 				    connector->count_modes == 0 ?
 				    ", built-in" : "");
+		if (stereo_layout != DRM_MODE_FLAG_3D_NONE &&
+		    stereo_layout_name)
+			weston_log_continue(", stereo=%s", stereo_layout_name);
+		weston_log_continue("\n");
+	}
 
 	return 0;
 
