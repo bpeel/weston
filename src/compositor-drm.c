@@ -1523,19 +1523,63 @@ find_crtc_for_connector(struct drm_compositor *ec,
 	return -1;
 }
 
+static struct gbm_surface *
+create_gbm_surface(struct gbm_device *gbm,
+		   const drmModeModeInfo *drm_mode,
+		   uint32_t format)
+{
+	const uint32_t flags = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING;
+	struct gbm_bo_mode mode;
+
+	switch ((drm_mode->flags & DRM_MODE_FLAG_3D_MASK)) {
+	case DRM_MODE_FLAG_3D_NONE:
+		mode.layout = GBM_BO_STEREO_LAYOUT_NONE;
+		break;
+	case DRM_MODE_FLAG_3D_FRAME_PACKING:
+		mode.layout = GBM_BO_STEREO_LAYOUT_FRAME_PACKING;
+		break;
+	case DRM_MODE_FLAG_3D_LINE_ALTERNATIVE:
+		mode.layout = GBM_BO_STEREO_LAYOUT_LINE_ALTERNATIVE;
+		break;
+	case DRM_MODE_FLAG_3D_SIDE_BY_SIDE_FULL:
+		mode.layout = GBM_BO_STEREO_LAYOUT_SIDE_BY_SIDE_FULL;
+		break;
+	case DRM_MODE_FLAG_3D_TOP_AND_BOTTOM:
+		mode.layout = GBM_BO_STEREO_LAYOUT_TOP_AND_BOTTOM;
+		break;
+	case DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF:
+		mode.layout = GBM_BO_STEREO_LAYOUT_SIDE_BY_SIDE_HALF;
+		break;
+	default:
+		return NULL;
+	}
+
+	mode.hdisplay = drm_mode->hdisplay;
+	mode.hsync_start = drm_mode->hsync_start;
+	mode.hsync_end = drm_mode->hsync_end;
+	mode.htotal = drm_mode->htotal;
+	mode.vdisplay = drm_mode->vdisplay;
+	mode.vsync_start = drm_mode->vsync_start;
+	mode.vsync_end = drm_mode->vsync_end;
+	mode.vtotal = drm_mode->vtotal;
+	mode.format = format;
+
+	return gbm_surface_create_with_mode(gbm, &mode, flags);
+}
+
 /* Init output state that depends on gl or gbm */
 static int
 drm_output_init_egl(struct drm_output *output, struct drm_compositor *ec)
 {
 	EGLint format = output->format;
+	struct drm_mode *drm_mode =
+		(struct drm_mode *) output->base.current_mode;
 	int i, flags;
 
-	output->surface = gbm_surface_create(ec->gbm,
-					     output->base.current_mode->width,
-					     output->base.current_mode->height,
-					     format,
-					     GBM_BO_USE_SCANOUT |
-					     GBM_BO_USE_RENDERING);
+	output->surface = create_gbm_surface(ec->gbm,
+					     &drm_mode->mode_info,
+					     format);
+
 	if (!output->surface) {
 		weston_log("failed to create gbm surface\n");
 		return -1;
