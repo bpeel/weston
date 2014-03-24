@@ -35,6 +35,7 @@
 #include <wayland-cursor.h>
 
 #include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 
@@ -49,6 +50,12 @@ typedef EGLBoolean (EGLAPIENTRYP PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC)(EGLDisplay 
 #define EGL_EXT_buffer_age 1
 #define EGL_BUFFER_AGE_EXT			0x313D
 #endif
+
+#define TEX_SIZE 256
+#define N_SQUARES 16
+#define SUB_WIDTH 100
+#define SUB_HEIGHT 120
+#define POS_ATTRIB 0
 
 struct window;
 struct seat;
@@ -74,6 +81,10 @@ struct display {
 	struct window *window;
 
 	PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC swap_buffers_with_damage;
+	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC target_texture_2d;
+	PFNEGLCREATEIMAGEKHRPROC create_image;
+	PFNEGLDESTROYIMAGEKHRPROC destroy_image;
+	PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC target_renderbuffer;
 };
 
 struct geometry {
@@ -84,9 +95,9 @@ struct window {
 	struct display *display;
 	struct geometry geometry, window_size;
 	struct {
-		GLuint rotation_uniform;
-		GLuint pos;
-		GLuint col;
+		GLuint tex_uniform;
+		GLuint tex;
+		GLuint tex_prog, simple_prog;
 	} gl;
 
 	uint32_t benchmark_time, frames;
@@ -101,21 +112,216 @@ struct window {
 static const char *vert_shader_text =
 	"uniform mat4 rotation;\n"
 	"attribute vec4 pos;\n"
-	"attribute vec4 color;\n"
-	"varying vec4 v_color;\n"
+	"varying vec2 tex_coord;\n"
 	"void main() {\n"
-	"  gl_Position = rotation * pos;\n"
-	"  v_color = color;\n"
+	"  gl_Position = pos;\n"
+	"  tex_coord = pos.st * vec2(0.5, -0.5) + 0.5;\n"
 	"}\n";
 
 static const char *frag_shader_text =
 	"precision mediump float;\n"
-	"varying vec4 v_color;\n"
+	"varying vec2 tex_coord;\n"
+	"uniform sampler2D tex;\n"
 	"void main() {\n"
-	"  gl_FragColor = v_color;\n"
+	"  gl_FragColor = texture2D(tex, tex_coord);\n"
+	"}\n";
+
+static const char *simple_vert =
+	"attribute vec4 pos;\n"
+	"void main() {\n"
+	"  gl_Position = pos;\n"
+	"}\n";
+
+static const char *simple_frag =
+	"precision mediump float;\n"
+	"void main() {\n"
+	"  gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0);\n"
 	"}\n";
 
 static int running = 1;
+
+static GLuint
+create_texture(void)
+{
+	GLuint tex;
+	char *data = malloc(TEX_SIZE * 4 * TEX_SIZE), *p = data;
+	uint8_t value;
+	int y, x;
+
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+	for (y = 0; y < TEX_SIZE; y++) {
+		for (x = 0; x < TEX_SIZE; x++) {
+			value = ((x ^ y) & N_SQUARES) ? 255 : 0;
+			*(p++) = value;
+			*(p++) = value;
+			*(p++) = value;
+			*(p++) = 255;
+		}
+	}
+
+	glTexImage2D(GL_TEXTURE_2D,
+		     0, /* level */
+		     GL_RGBA,
+		     TEX_SIZE, TEX_SIZE,
+		     0, /* border */
+		     GL_RGBA,
+		     GL_UNSIGNED_BYTE,
+		     data);
+
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	free(data);
+
+	return tex;
+}
+
+static GLuint
+create_shader(const char *source, GLenum shader_type)
+{
+	GLuint shader;
+	GLint status;
+
+	shader = glCreateShader(shader_type);
+	assert(shader != 0);
+
+	glShaderSource(shader, 1, (const char **) &source, NULL);
+	glCompileShader(shader);
+
+	glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+	if (!status) {
+		char log[1000];
+		GLsizei len;
+		glGetShaderInfoLog(shader, 1000, &len, log);
+		fprintf(stderr, "Error: compiling %s: %*s\n",
+			shader_type == GL_VERTEX_SHADER ? "vertex" : "fragment",
+			len, log);
+		exit(1);
+	}
+
+	return shader;
+}
+
+static GLuint
+create_program(const char *frag_source,
+	       const char *vert_source)
+{
+	GLuint frag, vert;
+	GLuint program;
+	GLint status;
+
+	frag = create_shader(frag_source, GL_FRAGMENT_SHADER);
+	vert = create_shader(vert_source, GL_VERTEX_SHADER);
+
+	program = glCreateProgram();
+	glAttachShader(program, frag);
+	glAttachShader(program, vert);
+
+	glBindAttribLocation(program, POS_ATTRIB, "pos");
+
+	glLinkProgram(program);
+
+	glGetProgramiv(program, GL_LINK_STATUS, &status);
+	if (!status) {
+		char log[1000];
+		GLsizei len;
+		glGetProgramInfoLog(program, 1000, &len, log);
+		fprintf(stderr, "Error: linking:\n%*s\n", len, log);
+		exit(1);
+	}
+
+	return program;
+}
+
+static void
+draw_triangle(struct window *window)
+{
+	static const GLfloat verts[] = {
+		-1.0, -1.0, -0.8, -1.0, -1.0, -0.8,
+		1.0, -1.0, 0.8, -1.0, 1.0, -0.8,
+		-1.0, 1.0, -0.8, 1.0, -1.0, 0.8,
+		1.0, 1.0, 0.8, 1.0, 1.0, 0.8
+	};
+
+	glUseProgram(window->gl.simple_prog);
+
+	glVertexAttribPointer(POS_ATTRIB, 2, GL_FLOAT, GL_FALSE, 0, verts);
+	glEnableVertexAttribArray(POS_ATTRIB);
+	glDrawArrays(GL_TRIANGLES, 0, sizeof verts / (sizeof verts[0] * 2));
+	glDisableVertexAttribArray(POS_ATTRIB);
+}
+
+static void
+munge_texture(struct window *window,
+	      GLuint texture)
+{
+	EGLint attribs[] = {
+		EGL_GL_TEXTURE_LEVEL_KHR, 0,
+		EGL_SUB_IMAGE_X_MESA, 100,
+		EGL_SUB_IMAGE_Y_MESA, 52,
+		EGL_SUB_IMAGE_WIDTH_MESA, SUB_WIDTH,
+		EGL_SUB_IMAGE_HEIGHT_MESA, SUB_HEIGHT,
+		EGL_NONE
+	};
+	struct display *display = window->display;
+	EGLImageKHR *image, *sub_image;
+	GLuint renderbuffer, framebuffer;
+
+	image = display->create_image(display->egl.dpy,
+				      display->egl.ctx,
+				      EGL_GL_TEXTURE_2D_KHR,
+				      (EGLClientBuffer) (unsigned long) texture,
+				      attribs);
+	sub_image = display->create_image(display->egl.dpy,
+					  NULL /* context */,
+					  EGL_SUB_IMAGE_MESA,
+					  (EGLClientBuffer) image,
+					  attribs);
+
+	glGenRenderbuffers(1, &renderbuffer);
+	glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
+	display->target_renderbuffer(GL_RENDERBUFFER, sub_image);
+
+	glGenFramebuffers(1, &framebuffer);
+	glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER,
+				  GL_COLOR_ATTACHMENT0,
+				  GL_RENDERBUFFER,
+				  renderbuffer);
+
+	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+		printf("Framebuffer is not complete\n");
+
+	glViewport(0.0, 0.0, SUB_WIDTH, SUB_HEIGHT);
+
+	glClearColor(1.0f, 1.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glEnable(GL_SCISSOR_TEST);
+
+	glScissor(0, 0, 10, 10);
+	glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glScissor(SUB_WIDTH - 10, SUB_HEIGHT - 10, 10, 10);
+	glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glDisable(GL_SCISSOR_TEST);
+
+	draw_triangle(window);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glDeleteFramebuffers(1, &framebuffer);
+
+	glBindRenderbuffer(GL_RENDERBUFFER, 0);
+	glDeleteRenderbuffers(1, &renderbuffer);
+
+	display->destroy_image(display->egl.dpy, sub_image);
+	display->destroy_image(display->egl.dpy, image);
+}
 
 static void
 init_egl(struct display *display, struct window *window)
@@ -192,6 +398,18 @@ init_egl(struct display *display, struct window *window)
 	if (display->swap_buffers_with_damage)
 		printf("has EGL_EXT_buffer_age and EGL_EXT_swap_buffers_with_damage\n");
 
+	display->target_texture_2d =
+		(void *)
+		eglGetProcAddress("glEGLImageTargetTexture2DOES");
+	display->target_renderbuffer =
+		(void *)
+		eglGetProcAddress("glEGLImageTargetRenderbufferStorageOES");
+	display->create_image =
+		(void *)
+		eglGetProcAddress("eglCreateImageKHR");
+	display->destroy_image =
+		(void *)
+		eglGetProcAddress("eglDestroyImageKHR");
 }
 
 static void
@@ -201,67 +419,20 @@ fini_egl(struct display *display)
 	eglReleaseThread();
 }
 
-static GLuint
-create_shader(struct window *window, const char *source, GLenum shader_type)
-{
-	GLuint shader;
-	GLint status;
-
-	shader = glCreateShader(shader_type);
-	assert(shader != 0);
-
-	glShaderSource(shader, 1, (const char **) &source, NULL);
-	glCompileShader(shader);
-
-	glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
-	if (!status) {
-		char log[1000];
-		GLsizei len;
-		glGetShaderInfoLog(shader, 1000, &len, log);
-		fprintf(stderr, "Error: compiling %s: %*s\n",
-			shader_type == GL_VERTEX_SHADER ? "vertex" : "fragment",
-			len, log);
-		exit(1);
-	}
-
-	return shader;
-}
-
 static void
 init_gl(struct window *window)
 {
-	GLuint frag, vert;
-	GLuint program;
-	GLint status;
+	window->gl.tex_prog = create_program(frag_shader_text,
+					     vert_shader_text);
 
-	frag = create_shader(window, frag_shader_text, GL_FRAGMENT_SHADER);
-	vert = create_shader(window, vert_shader_text, GL_VERTEX_SHADER);
+	window->gl.tex_uniform =
+		glGetUniformLocation(window->gl.tex_prog, "tex");
 
-	program = glCreateProgram();
-	glAttachShader(program, frag);
-	glAttachShader(program, vert);
-	glLinkProgram(program);
+	glUseProgram(window->gl.tex_prog);
+	glUniform1i(window->gl.tex_uniform, 0);
 
-	glGetProgramiv(program, GL_LINK_STATUS, &status);
-	if (!status) {
-		char log[1000];
-		GLsizei len;
-		glGetProgramInfoLog(program, 1000, &len, log);
-		fprintf(stderr, "Error: linking:\n%*s\n", len, log);
-		exit(1);
-	}
-
-	glUseProgram(program);
-	
-	window->gl.pos = 0;
-	window->gl.col = 1;
-
-	glBindAttribLocation(program, window->gl.pos, "pos");
-	glBindAttribLocation(program, window->gl.col, "color");
-	glLinkProgram(program);
-
-	window->gl.rotation_uniform =
-		glGetUniformLocation(program, "rotation");
+	window->gl.simple_prog = create_program(simple_frag,
+						simple_vert);
 }
 
 static void
@@ -360,6 +531,8 @@ create_surface(struct window *window)
 	xdg_surface_request_change_state(window->xdg_surface,
 					 XDG_SURFACE_STATE_FULLSCREEN,
 					 window->fullscreen, 0);
+
+	window->gl.tex = create_texture();
 }
 
 static void
@@ -387,28 +560,15 @@ redraw(void *data, struct wl_callback *callback, uint32_t time)
 {
 	struct window *window = data;
 	struct display *display = window->display;
-	static const GLfloat verts[3][2] = {
-		{ -0.5, -0.5 },
-		{  0.5, -0.5 },
-		{  0,    0.5 }
+	static const GLfloat verts[4][2] = {
+		{ -1.0, -1.0 },
+		{  1.0, -1.0 },
+		{ -1.0,  1.0 },
+		{  1.0,  1.0 }
 	};
-	static const GLfloat colors[3][3] = {
-		{ 1, 0, 0 },
-		{ 0, 1, 0 },
-		{ 0, 0, 1 }
-	};
-	GLfloat angle;
-	GLfloat rotation[4][4] = {
-		{ 1, 0, 0, 0 },
-		{ 0, 1, 0, 0 },
-		{ 0, 0, 1, 0 },
-		{ 0, 0, 0, 1 }
-	};
-	static const uint32_t speed_div = 5, benchmark_interval = 5;
 	struct wl_region *region;
 	EGLint rect[4];
 	EGLint buffer_age = 0;
-	struct timeval tv;
 
 	assert(window->callback == callback);
 	window->callback = NULL;
@@ -416,46 +576,27 @@ redraw(void *data, struct wl_callback *callback, uint32_t time)
 	if (callback)
 		wl_callback_destroy(callback);
 
-	gettimeofday(&tv, NULL);
-	time = tv.tv_sec * 1000 + tv.tv_usec / 1000;
-	if (window->frames == 0)
-		window->benchmark_time = time;
-	if (time - window->benchmark_time > (benchmark_interval * 1000)) {
-		printf("%d frames in %d seconds: %f fps\n",
-		       window->frames,
-		       benchmark_interval,
-		       (float) window->frames / benchmark_interval);
-		window->benchmark_time = time;
-		window->frames = 0;
-	}
-
-	angle = (time / speed_div) % 360 * M_PI / 180.0;
-	rotation[0][0] =  cos(angle);
-	rotation[0][2] =  sin(angle);
-	rotation[2][0] = -sin(angle);
-	rotation[2][2] =  cos(angle);
-
 	if (display->swap_buffers_with_damage)
 		eglQuerySurface(display->egl.dpy, window->egl_surface,
 				EGL_BUFFER_AGE_EXT, &buffer_age);
 
+	glUseProgram(window->gl.tex_prog);
+
 	glViewport(0, 0, window->geometry.width, window->geometry.height);
 
-	glUniformMatrix4fv(window->gl.rotation_uniform, 1, GL_FALSE,
-			   (GLfloat *) rotation);
-
-	glClearColor(0.0, 0.0, 0.0, 0.5);
+	glClearColor(0.0, 0.0, 0.0, 1.0);
 	glClear(GL_COLOR_BUFFER_BIT);
 
-	glVertexAttribPointer(window->gl.pos, 2, GL_FLOAT, GL_FALSE, 0, verts);
-	glVertexAttribPointer(window->gl.col, 3, GL_FLOAT, GL_FALSE, 0, colors);
-	glEnableVertexAttribArray(window->gl.pos);
-	glEnableVertexAttribArray(window->gl.col);
+	glBindTexture(GL_TEXTURE_2D, window->gl.tex);
 
-	glDrawArrays(GL_TRIANGLES, 0, 3);
+	glVertexAttribPointer(POS_ATTRIB, 2, GL_FLOAT, GL_FALSE, 0, verts);
+	glEnableVertexAttribArray(POS_ATTRIB);
 
-	glDisableVertexAttribArray(window->gl.pos);
-	glDisableVertexAttribArray(window->gl.col);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+	glDisableVertexAttribArray(POS_ATTRIB);
+
+	glBindTexture(GL_TEXTURE_2D, 0);
 
 	if (window->opaque || window->fullscreen) {
 		region = wl_compositor_create_region(window->display->compositor);
@@ -760,8 +901,8 @@ main(int argc, char **argv)
 
 	window.display = &display;
 	display.window = &window;
-	window.window_size.width  = 250;
-	window.window_size.height = 250;
+	window.window_size.width  = TEX_SIZE;
+	window.window_size.height = TEX_SIZE;
 	window.buffer_size = 32;
 	window.frame_sync = 1;
 
@@ -792,6 +933,7 @@ main(int argc, char **argv)
 	init_egl(&display, &window);
 	create_surface(&window);
 	init_gl(&window);
+	munge_texture(&window, window.gl.tex);
 
 	display.cursor_surface =
 		wl_compositor_create_surface(display.compositor);
