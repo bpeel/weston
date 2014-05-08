@@ -3120,9 +3120,37 @@ weston_compositor_remove_output(struct weston_compositor *compositor,
 	}
 }
 
+static int
+zombie_dispatcher(const void *data, void *resource, uint32_t opcode,
+		  const struct wl_message *msg, union wl_argument *args)
+{
+	const void *implementation = wl_resource_get_implementation(resource);
+	uint32_t destructor = (uintptr_t) implementation;
+
+	if (opcode == destructor)
+		wl_resource_destroy(resource);
+
+	return 0;
+}
+
+WL_EXPORT void
+weston_resource_zombify(struct wl_resource *res, uint32_t destructor)
+{
+	/* Set a dummy dispatcher so that all requests will be
+	 * ignored. The NULL user_data is used to mark that this is a
+	 * zombie. The destructor opcode is stashed in the
+	 * implementation pointer */
+	wl_resource_set_dispatcher(res, zombie_dispatcher,
+				   (void *) (uintptr_t) destructor,
+				   NULL /* user data */,
+				   NULL /* destroy */);
+}
+
 WL_EXPORT void
 weston_output_destroy(struct weston_output *output)
 {
+	struct wl_resource *resource, *tmp;
+
 	output->destroying = 1;
 
 	weston_compositor_remove_output(output->compositor, output);
@@ -3137,6 +3165,11 @@ weston_output_destroy(struct weston_output *output)
 	output->compositor->output_id_pool &= ~(1 << output->id);
 
 	wl_global_destroy(output->global);
+
+	wl_resource_for_each_safe(resource, tmp, &output->resource_list)
+		weston_resource_zombify(resource,
+					WL_REQUEST_OPCODE(wl_output_interface,
+							  release));
 }
 
 static void

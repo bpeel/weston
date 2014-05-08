@@ -1416,6 +1416,9 @@ weston_transformed_region(int width, int height,
 void *
 weston_load_module(const char *name, const char *entrypoint);
 
+void
+weston_resource_zombify(struct wl_resource *res, uint32_t destructor);
+
 #ifdef  __cplusplus
 }
 #endif

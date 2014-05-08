@@ -2431,10 +2431,12 @@ shell_surface_set_fullscreen(struct wl_client *client,
 	struct shell_surface *shsurf = wl_resource_get_user_data(resource);
 	struct weston_output *output;
 
-	if (output_resource)
+	if (output_resource) {
 		output = wl_resource_get_user_data(output_resource);
-	else
+		/* Output can be NULL here if the resource is a zombie */
+	} else {
 		output = NULL;
+	}
 
 	shell_surface_set_parent(shsurf, NULL);
 
@@ -2566,10 +2568,12 @@ shell_surface_set_maximized(struct wl_client *client,
 	shsurf->type = SHELL_SURFACE_TOPLEVEL;
 	shell_surface_set_parent(shsurf, NULL);
 
-	if (output_resource)
+	if (output_resource) {
 		output = wl_resource_get_user_data(output_resource);
-	else
+		/* output can be NULL here if the resource is zombified */
+	} else {
 		output = NULL;
+	}
 
 	shell_surface_set_output(shsurf, output);
 
@@ -3487,10 +3491,13 @@ xdg_surface_set_fullscreen(struct wl_client *client,
 	shsurf->state_requested = true;
 	shsurf->requested_state.fullscreen = true;
 
-	if (output_resource)
+	if (output_resource) {
 		output = wl_resource_get_user_data(output_resource);
-	else
+		/* output can still be NULL here if the resource has
+		 * become a zombie */
+	} else {
 		output = NULL;
+	}
 
 	shell_surface_set_output(shsurf, output);
 	shsurf->fullscreen_output = shsurf->output;
@@ -3919,6 +3926,10 @@ desktop_shell_set_background(struct wl_client *client,
 		return;
 	}
 
+	/* Skip the request if the output has become a zombie */
+	if (wl_resource_get_user_data(output_resource) == NULL)
+		return;
+
 	wl_list_for_each_safe(view, next, &surface->views, surface_link)
 		weston_view_destroy(view);
 	view = weston_view_create(surface);
@@ -3953,6 +3964,7 @@ desktop_shell_set_panel(struct wl_client *client,
 	struct desktop_shell *shell = wl_resource_get_user_data(resource);
 	struct weston_surface *surface =
 		wl_resource_get_user_data(surface_resource);
+	struct weston_output *output;
 	struct weston_view *view, *next;
 
 	if (surface->configure) {
@@ -3962,14 +3974,20 @@ desktop_shell_set_panel(struct wl_client *client,
 		return;
 	}
 
+	output = wl_resource_get_user_data(output_resource);
+
+	/* Skip the request if the output has become a zombie */
+	if (output == NULL)
+		return;
+
 	wl_list_for_each_safe(view, next, &surface->views, surface_link)
 		weston_view_destroy(view);
 	view = weston_view_create(surface);
 
 	surface->configure = panel_configure;
 	surface->configure_private = shell;
-	surface->output = wl_resource_get_user_data(output_resource);
-	view->output = surface->output;
+	surface->output = output;
+	view->output = output;
 	desktop_shell_send_configure(resource, 0,
 				     surface_resource,
 				     surface->output->width,
@@ -5361,6 +5379,10 @@ screensaver_set_surface(struct wl_client *client,
 		wl_resource_get_user_data(surface_resource);
 	struct weston_output *output = wl_resource_get_user_data(output_resource);
 	struct weston_view *view, *next;
+
+	/* Skip the request if the output has become a zombie */
+	if (output == NULL)
+		return;
 
 	/* Make sure we only have one view */
 	wl_list_for_each_safe(view, next, &surface->views, surface_link)

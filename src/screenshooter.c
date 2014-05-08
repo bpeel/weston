@@ -213,6 +213,33 @@ weston_screenshooter_shoot(struct weston_output *output,
 }
 
 static void
+shoot_zombie_output(struct weston_buffer *buffer,
+		    weston_screenshooter_done_func_t done,
+		    void *data)
+{
+	struct wl_shm_buffer *shm_buffer;
+	int32_t height, stride;
+	void *pixels;
+
+	shm_buffer = wl_shm_buffer_get(buffer->resource);
+
+	if (shm_buffer == NULL) {
+		done(data, WESTON_SCREENSHOOTER_BAD_BUFFER);
+		return;
+	}
+
+	height = wl_shm_buffer_get_height(shm_buffer);
+	stride = wl_shm_buffer_get_stride(shm_buffer);
+	pixels = wl_shm_buffer_get_data(shm_buffer);
+
+	wl_shm_buffer_begin_access(shm_buffer);
+	memset(pixels, 0, height * stride);
+	wl_shm_buffer_end_access(shm_buffer);
+
+	done(data, WESTON_SCREENSHOOTER_SUCCESS);
+}
+
+static void
 screenshooter_done(void *data, enum weston_screenshooter_outcome outcome)
 {
 	struct wl_resource *resource = data;
@@ -235,17 +262,28 @@ screenshooter_shoot(struct wl_client *client,
 		    struct wl_resource *output_resource,
 		    struct wl_resource *buffer_resource)
 {
-	struct weston_output *output =
-		wl_resource_get_user_data(output_resource);
-	struct weston_buffer *buffer =
-		weston_buffer_from_resource(buffer_resource);
+	struct weston_output *output;
+	struct weston_buffer *buffer;
+
+	output = wl_resource_get_user_data(output_resource);
+	buffer = weston_buffer_from_resource(buffer_resource);
 
 	if (buffer == NULL) {
 		wl_resource_post_no_memory(resource);
 		return;
 	}
 
-	weston_screenshooter_shoot(output, buffer, screenshooter_done, resource);
+	/* If the output has become a zombie then we obviously can't
+	 * take a screenshot. We don't want to report an error because
+	 * that would likely make the client abort and this is an
+	 * unavoidable occurence. Instead we can just clear the
+	 * buffer. This is probably reasonable because that is what
+	 * the output will actually if it is unplugged */
+	if (output == NULL)
+		shoot_zombie_output(buffer, screenshooter_done, resource);
+	else
+		weston_screenshooter_shoot(output, buffer,
+					   screenshooter_done, resource);
 }
 
 struct screenshooter_interface screenshooter_implementation = {

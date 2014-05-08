@@ -252,6 +252,12 @@ input_panel_surface_set_toplevel(struct wl_client *client,
 	struct input_panel_surface *input_panel_surface =
 		wl_resource_get_user_data(resource);
 	struct desktop_shell *shell = input_panel_surface->shell;
+	struct weston_output *output;
+
+	output = wl_resource_get_user_data(output_resource);
+	/* Ignore the request if the output has become a zombie */
+	if (output == NULL)
+		return;
 
 	wl_list_insert(&shell->input_panel.surfaces,
 		       &input_panel_surface->link);

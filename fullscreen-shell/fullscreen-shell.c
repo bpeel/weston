@@ -673,6 +673,14 @@ fullscreen_shell_present_surface(struct wl_client *client,
 
 	if (output_res) {
 		output = wl_resource_get_user_data(output_res);
+		/* Ignore the request if the output is a zombie */
+		if (output == NULL)
+			return;
+	} else {
+		output = NULL;
+	}
+
+	if (output) {
 		fsout = fs_output_for_output(output);
 		fs_output_set_surface(fsout, surface, method, 0, 0);
 	} else {
@@ -712,6 +720,11 @@ fullscreen_shell_present_surface_for_mode(struct wl_client *client,
 	struct fs_output *fsout;
 
 	output = wl_resource_get_user_data(output_res);
+
+	/* Skip the request if the output has become a zombie */
+	if (output == NULL)
+		return;
+
 	fsout = fs_output_for_output(output);
 
 	if (surface_res == NULL) {
