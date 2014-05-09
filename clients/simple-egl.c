@@ -55,6 +55,12 @@ typedef EGLBoolean (EGLAPIENTRYP PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC)(EGLDisplay 
 struct window;
 struct seat;
 
+struct output {
+	struct wl_output *wl_output;
+	struct wl_list link;
+	uint32_t name;
+};
+
 struct display {
 	struct wl_display *display;
 	struct wl_registry *registry;
@@ -68,6 +74,7 @@ struct display {
 	struct wl_cursor_theme *cursor_theme;
 	struct wl_cursor *default_cursor;
 	struct wl_surface *cursor_surface;
+	struct wl_list outputs;
 	struct {
 		EGLDisplay dpy;
 		EGLContext ctx;
@@ -683,6 +690,17 @@ static_assert(XDG_VERSION == XDG_SHELL_VERSION_CURRENT,
 #endif
 
 static void
+add_output(struct display *d, uint32_t name)
+{
+	struct output *output = malloc(sizeof *output);
+
+	output->wl_output = wl_registry_bind(d->registry, name,
+					     &wl_output_interface, 3);
+	output->name = name;
+	wl_list_insert(&d->outputs, &output->link);
+}
+
+static void
 registry_handle_global(void *data, struct wl_registry *registry,
 		       uint32_t name, const char *interface, uint32_t version)
 {
@@ -715,6 +733,8 @@ registry_handle_global(void *data, struct wl_registry *registry,
 			fprintf(stderr, "unable to load default left pointer\n");
 			// TODO: abort ?
 		}
+	} else if (strcmp(interface, "wl_output") == 0) {
+		add_output(d, name);
 	}
 }
 
@@ -722,6 +742,16 @@ static void
 registry_handle_global_remove(void *data, struct wl_registry *registry,
 			      uint32_t name)
 {
+	struct display *d = data;
+	struct output *output;
+
+	wl_list_for_each(output, &d->outputs, link) {
+		if (output->name == name) {
+			wl_output_release(output->wl_output);
+			wl_list_remove(&output->link);
+			return;
+		}
+	}
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -763,6 +793,7 @@ main(int argc, char **argv)
 	window.window_size = window.geometry;
 	window.buffer_size = 32;
 	window.frame_sync = 1;
+	wl_list_init(&display.outputs);
 
 	for (i = 1; i < argc; i++) {
 		if (strcmp("-f", argv[i]) == 0)
