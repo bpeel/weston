@@ -3038,6 +3038,18 @@ weston_compositor_stack_plane(struct weston_compositor *ec,
 		wl_list_insert(&ec->plane_list, &plane->link);
 }
 
+static void
+output_release(struct wl_client *client,
+	       struct wl_resource *resource)
+{
+	wl_resource_destroy(resource);
+}
+
+static struct wl_output_interface
+output_interface = {
+	output_release
+};
+
 static void unbind_resource(struct wl_resource *resource)
 {
 	wl_list_remove(wl_resource_get_link(resource));
@@ -3052,14 +3064,15 @@ bind_output(struct wl_client *client,
 	struct wl_resource *resource;
 
 	resource = wl_resource_create(client, &wl_output_interface,
-				      MIN(version, 2), id);
+				      MIN(version, 3), id);
 	if (resource == NULL) {
 		wl_client_post_no_memory(client);
 		return;
 	}
 
 	wl_list_insert(&output->resource_list, wl_resource_get_link(resource));
-	wl_resource_set_implementation(resource, NULL, data, unbind_resource);
+	wl_resource_set_implementation(resource, &output_interface,
+				       data, unbind_resource);
 
 	wl_output_send_geometry(resource,
 				output->x,
@@ -3321,7 +3334,7 @@ weston_output_init(struct weston_output *output, struct weston_compositor *c,
 	output->compositor->output_id_pool |= 1 << output->id;
 
 	output->global =
-		wl_global_create(c->wl_display, &wl_output_interface, 2,
+		wl_global_create(c->wl_display, &wl_output_interface, 3,
 				 output, bind_output);
 	wl_signal_emit(&c->output_created_signal, output);
 }
