@@ -54,6 +54,7 @@ struct screenshooter_output {
 	int width, height, offset_x, offset_y;
 	void *data;
 	struct wl_list link;
+	uint32_t name;
 };
 
 static void
@@ -126,6 +127,9 @@ static const struct screenshooter_listener screenshooter_listener = {
 	screenshot_done
 };
 
+static struct wl_buffer *
+create_shm_buffer(int width, int height, void **data_out);
+
 static void
 handle_global(void *data, struct wl_registry *registry,
 	      uint32_t name, const char *interface, uint32_t version)
@@ -134,6 +138,7 @@ handle_global(void *data, struct wl_registry *registry,
 
 	if (strcmp(interface, "wl_output") == 0) {
 		output = xmalloc(sizeof *output);
+		output->name = name;
 		output->output = wl_registry_bind(registry, name,
 						  &wl_output_interface, 1);
 		wl_list_insert(&output_list, &output->link);
@@ -149,7 +154,19 @@ handle_global(void *data, struct wl_registry *registry,
 static void
 handle_global_remove(void *data, struct wl_registry *registry, uint32_t name)
 {
-	/* XXX: unimplemented */
+	struct screenshooter_output *output;
+
+	wl_list_for_each(output, &output_list, link) {
+		if (output->name != name)
+			continue;
+
+		output->buffer = create_shm_buffer(output->width,
+						   output->height,
+						   &output->data);
+		screenshooter_shoot(screenshooter,
+				    output->output,
+				    output->buffer);
+	}
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -201,25 +218,30 @@ write_png(int width, int height)
 	void *data, *d, *s;
 	struct screenshooter_output *output, *next;
 
+	wl_list_for_each_safe(output, next, &output_list, link) {
+		if (output->data)
+			goto found_output;
+	}
+
+	return;
+
+found_output:
+	width = output->width;
+	height = output->height;
 	buffer_stride = width * 4;
 
 	data = xmalloc(buffer_stride * height);
 	if (!data)
 		return;
 
-	wl_list_for_each_safe(output, next, &output_list, link) {
-		output_stride = output->width * 4;
-		s = output->data;
-		d = data + (output->offset_y - min_y) * buffer_stride +
-			   (output->offset_x - min_x) * 4;
+	output_stride = output->width * 4;
+	s = output->data;
+	d = data;
 
-		for (i = 0; i < output->height; i++) {
-			memcpy(d, s, output_stride);
-			d += buffer_stride;
-			s += output_stride;
-		}
-
-		free(output);
+	for (i = 0; i < output->height; i++) {
+		memcpy(d, s, output_stride);
+		d += buffer_stride;
+		s += output_stride;
 	}
 
 	surface = cairo_image_surface_create_for_data(data,
@@ -263,7 +285,6 @@ int main(int argc, char *argv[])
 {
 	struct wl_display *display;
 	struct wl_registry *registry;
-	struct screenshooter_output *output;
 	int width, height;
 
 	if (getenv("WAYLAND_SOCKET") == NULL) {
@@ -294,14 +315,9 @@ int main(int argc, char *argv[])
 	if (set_buffer_size(&width, &height))
 		return -1;
 
-
-	wl_list_for_each(output, &output_list, link) {
-		output->buffer = create_shm_buffer(output->width, output->height, &output->data);
-		screenshooter_shoot(screenshooter, output->output, output->buffer);
-		buffer_copy_done = 0;
-		while (!buffer_copy_done)
-			wl_display_roundtrip(display);
-	}
+	buffer_copy_done = 0;
+	while (!buffer_copy_done)
+		wl_display_roundtrip(display);
 
 	write_png(width, height);
 
